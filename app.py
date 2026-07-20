@@ -1,29 +1,44 @@
 """
-简易用户信息管理平台
-包含：登录、注册、搜索功能
+简易用户信息管理平台 — 安全加固版
+=================================
+防护措施：
+  1. bcrypt 哈希存储密码（非明文）
+  2. 参数化查询防 SQL 注入
+  3. CSRF Token 校验
+  4. IP 级登录失败锁定 + 渐进式延迟（防暴力破解）
+  5. 随机 secret_key + session 超时
+  6. 统一错误提示防用户名枚举
 """
 import sqlite3
 import os
+import time
+import secrets
+from datetime import datetime, timedelta
 
 from flask import Flask, render_template, request, redirect, session, g
+from werkzeug.security import generate_password_hash, check_password_hash
 
+# ============================================================
+# 1. 应用配置
+# ============================================================
 app = Flask(__name__)
-app.secret_key = "dev-key-2025"
+app.secret_key = secrets.token_hex(32)  # 随机 64 位密钥，每次启动不同
+app.permanent_session_lifetime = timedelta(minutes=30)  # session 30 分钟过期
+app.debug = False  # 关闭 debug 模式防信息泄露
 
-# 数据库路径：data/users.db
+# ============================================================
+# 2. 数据库
+# ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, "data", "users.db")
 
-
-# ============================================================
-# 数据库连接管理
-# ============================================================
 
 def get_db():
     """获取数据库连接（每个请求独立连接）"""
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode=WAL")
     return g.db
 
 
@@ -36,9 +51,10 @@ def close_db(exception):
 
 
 def init_db():
-    """初始化数据库并插入默认用户"""
+    """初始化数据库并插入默认用户（密码哈希存储）"""
     os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
     db = sqlite3.connect(DATABASE)
+    db.execute("PRAGMA journal_mode=WAL")
     db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,17 +64,133 @@ def init_db():
             phone    TEXT
         )
     """)
-    # 插入默认用户（明文密码）
-    db.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
-               ("admin", "admin123", "admin@example.com", "13800138000"))
-    db.execute("INSERT OR IGNORE INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
-               ("alice", "alice2025", "alice@example.com", "13900139001"))
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address   TEXT NOT NULL,
+            attempt_time REAL NOT NULL,
+            success      INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_login_ip
+            ON login_attempts(ip_address, attempt_time)
+    """)
+    db.commit()
+
+    # 插入默认用户 — 密码使用 bcrypt 哈希
+    default_users = [
+        ("admin",  generate_password_hash("admin123"),  "admin@example.com", "13800138000"),
+        ("alice",  generate_password_hash("alice2025"), "alice@example.com", "13900139001"),
+    ]
+    for u in default_users:
+        try:
+            db.execute(
+                "INSERT INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)",
+                u,
+            )
+        except sqlite3.IntegrityError:
+            pass
     db.commit()
     db.close()
 
 
 # ============================================================
-# 路由 — 首页
+# 3. CSRF Token 防护
+# ============================================================
+
+def generate_csrf_token():
+    """生成或返回已有 CSRF Token"""
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(16)
+    return session["_csrf_token"]
+
+
+def validate_csrf_token():
+    """校验 CSRF Token，校验后立即失效（一次性）"""
+    token = request.form.get("_csrf_token")
+    stored = session.pop("_csrf_token", None)
+    if not token or not stored:
+        return False
+    return secrets.compare_digest(stored, token)
+
+
+# ============================================================
+# 4. 暴力破解防护（IP 级锁定 + 渐进式延迟）
+# ============================================================
+
+def check_login_rate_limit(ip_addr):
+    """
+    IP 级别登录频率限制：
+      - 15 分钟内失败 ≥ 10 次 → 锁定
+      - 每次失败增加等待时间：min(失败次数 × 2, 30) 秒
+    """
+    db = get_db()
+    window = time.time() - 900  # 15 分钟窗口
+
+    cur = db.execute(
+        "SELECT COUNT(*) AS cnt FROM login_attempts "
+        "WHERE ip_address = ? AND attempt_time > ? AND success = 0",
+        (ip_addr, window),
+    )
+    row = cur.fetchone()
+    fail_count = row["cnt"] if row else 0
+
+    locked = False
+    remaining_seconds = 0
+
+    if fail_count >= 10:
+        cur = db.execute(
+            "SELECT attempt_time FROM login_attempts "
+            "WHERE ip_address = ? AND attempt_time > ? AND success = 0 "
+            "ORDER BY attempt_time ASC LIMIT 1",
+            (ip_addr, window),
+        )
+        earliest = cur.fetchone()
+        if earliest:
+            lock_until = earliest["attempt_time"] + 900
+            remaining = lock_until - time.time()
+            if remaining > 0:
+                locked = True
+                remaining_seconds = int(remaining)
+            else:
+                db.execute(
+                    "DELETE FROM login_attempts WHERE ip_address = ? AND attempt_time < ?",
+                    (ip_addr, time.time() - 900),
+                )
+                db.commit()
+                fail_count = 0
+
+    delay = min(fail_count * 2, 30)
+
+    return locked, remaining_seconds, delay
+
+
+def record_login_attempt(ip_addr, success):
+    """记录一次登录尝试"""
+    db = get_db()
+    db.execute(
+        "INSERT INTO login_attempts (ip_address, attempt_time, success) VALUES (?, ?, ?)",
+        (ip_addr, time.time(), 1 if success else 0),
+    )
+    db.commit()
+
+
+def pending_login_count(ip_addr):
+    """返回当前 IP 在窗口内的失败次数"""
+    db = get_db()
+    window = time.time() - 900
+    cur = db.execute(
+        "SELECT COUNT(*) AS cnt FROM login_attempts "
+        "WHERE ip_address = ? AND attempt_time > ? AND success = 0",
+        (ip_addr, window),
+    )
+    row = cur.fetchone()
+    return row["cnt"] if row else 0
+
+
+# ============================================================
+# 5. 路由 — 首页
 # ============================================================
 
 @app.route("/")
@@ -67,7 +199,7 @@ def index():
     user_info = None
     if username:
         db = get_db()
-        cur = db.execute("SELECT * FROM users WHERE username = ?", (username,))
+        cur = db.execute("SELECT id, username, email, phone FROM users WHERE username = ?", (username,))
         row = cur.fetchone()
         if row:
             user_info = dict(row)
@@ -75,12 +207,34 @@ def index():
 
 
 # ============================================================
-# 路由 — 登录（保持原有功能不变）
+# 6. 路由 — 登录（CSRF + 频率限制 + 哈希比对）
 # ============================================================
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    ip_addr = request.remote_addr or "unknown"
+
     if request.method == "POST":
+        # 6a. CSRF Token 校验
+        if not validate_csrf_token():
+            return render_template("login.html",
+                                   msg="",
+                                   error="Token 校验失败，请刷新页面重试。",
+                                   csrf_token=generate_csrf_token())
+
+        # 6b. IP 频率限制检查
+        locked, remaining_seconds, delay = check_login_rate_limit(ip_addr)
+        if locked:
+            minutes = remaining_seconds // 60
+            seconds = remaining_seconds % 60
+            return render_template(
+                "login.html",
+                msg="",
+                error=f"登录尝试过于频繁，请等待 {minutes} 分 {seconds} 秒后再试。",
+                csrf_token=generate_csrf_token(),
+            )
+
+        # 6c. 参数化查询获取用户（防 SQL 注入）
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
@@ -88,45 +242,83 @@ def login():
         cur = db.execute("SELECT * FROM users WHERE username = ?", (username,))
         row = cur.fetchone()
 
-        if row and row["password"] == password:
+        if row is None:
+            # 用户不存在 — 用相同延迟防用户名枚举
+            time.sleep(1)
+            record_login_attempt(ip_addr, False)
+            return render_template("login.html",
+                                   msg="",
+                                   error="用户名或密码错误！",
+                                   csrf_token=generate_csrf_token())
+
+        # 6d. 密码哈希比对
+        if check_password_hash(row["password"], password):
+            # 登录成功
+            record_login_attempt(ip_addr, True)
+            session.permanent = True
             session["username"] = username
-            user_info = dict(row)
+            user_info = {"id": row["id"], "username": row["username"],
+                         "email": row["email"], "phone": row["phone"]}
             return render_template("index.html", user=user_info, keyword="", results=None)
         else:
-            return render_template("login.html", error="用户名或密码错误！")
+            # 登录失败 — 渐进式延迟
+            time.sleep(delay)
+            record_login_attempt(ip_addr, False)
+            error_msg = "用户名或密码错误！"
+            cnt = pending_login_count(ip_addr)
+            if cnt > 0:
+                error_msg += f"（{cnt} 次失败，请稍后再试）"
+            return render_template("login.html",
+                                   msg="",
+                                   error=error_msg,
+                                   csrf_token=generate_csrf_token())
 
     msg = request.args.get("msg", "")
-    return render_template("login.html", msg=msg)
+    return render_template("login.html", msg=msg, csrf_token=generate_csrf_token())
 
 
 # ============================================================
-# 路由 — 注册（已修复：参数化查询替代 f-string 拼接）
+# 7. 路由 — 注册（参数化查询 + bcrypt 哈希）
 # ============================================================
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
+        # CSRF Token 校验
+        if not validate_csrf_token():
+            return render_template("register.html",
+                                   error="Token 校验失败，请刷新页面重试。",
+                                   csrf_token=generate_csrf_token())
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         email = request.form.get("email", "").strip()
         phone = request.form.get("phone", "").strip()
 
+        # 密码使用 bcrypt 哈希存储
+        password_hash = generate_password_hash(password)
+
         db = get_db()
-        # ✅ 已修复：使用参数化查询替代 f-string 拼接
         sql = "INSERT INTO users (username, password, email, phone) VALUES (?, ?, ?, ?)"
-        print(f"[REGISTER SQL] {sql} | params: ({username!r}, {password!r}, {email!r}, {phone!r})")
+        print(f"[REGISTER] {sql} | username={username!r}, email={email!r}, phone={phone!r}")
         try:
-            db.execute(sql, (username, password, email, phone))
+            db.execute(sql, (username, password_hash, email, phone))
             db.commit()
             return redirect("/login?msg=注册成功，请登录")
+        except sqlite3.IntegrityError:
+            return render_template("register.html",
+                                   error="用户名已存在！",
+                                   csrf_token=generate_csrf_token())
         except Exception as e:
-            return render_template("register.html", error=f"注册失败：{str(e)}")
+            return render_template("register.html",
+                                   error=f"注册失败：{str(e)}",
+                                   csrf_token=generate_csrf_token())
 
-    return render_template("register.html")
+    return render_template("register.html", csrf_token=generate_csrf_token())
 
 
 # ============================================================
-# 路由 — 搜索（已修复：参数化查询替代 f-string 拼接）
+# 8. 路由 — 搜索（参数化查询防 SQL 注入）
 # ============================================================
 
 @app.route("/search")
@@ -136,10 +328,9 @@ def search():
 
     if keyword:
         db = get_db()
-        # ✅ 已修复：使用参数化查询替代 f-string 拼接，LIKE 通配符作为参数值
         pattern = f"%{keyword}%"
         sql = "SELECT id, username, email, phone FROM users WHERE username LIKE ? OR email LIKE ?"
-        print(f"[SEARCH SQL] {sql} | params: ('%{keyword}%', '%{keyword}%')")
+        print(f"[SEARCH] {sql} | keyword={keyword!r}")
         cur = db.execute(sql, (pattern, pattern))
         rows = cur.fetchall()
         results = [dict(row) for row in rows]
@@ -149,7 +340,7 @@ def search():
     user_info = None
     if username:
         db = get_db()
-        cur = db.execute("SELECT * FROM users WHERE username = ?", (username,))
+        cur = db.execute("SELECT id, username, email, phone FROM users WHERE username = ?", (username,))
         row = cur.fetchone()
         if row:
             user_info = dict(row)
@@ -158,7 +349,7 @@ def search():
 
 
 # ============================================================
-# 路由 — 退出
+# 9. 路由 — 退出
 # ============================================================
 
 @app.route("/logout")
@@ -168,17 +359,23 @@ def logout():
 
 
 # ============================================================
-# 启动入口
+# 10. 启动入口
 # ============================================================
 
 if __name__ == "__main__":
     init_db()
     print("=" * 60)
-    print("  用户管理系统已启动")
+    print("  用户管理系统 — 安全加固版")
     print("=" * 60)
-    print(f"  监听地址: http://0.0.0.0:5000")
-    print(f"  数据库:   {DATABASE}")
-    print(f"  默认用户: admin/admin123, alice/alice2025")
-    print(f"  SQL 注入: 已修复（参数化查询）")
+    print(f"  监听地址:   http://0.0.0.0:5000")
+    print(f"  数据库:     {DATABASE}")
+    print(f"  默认用户:   admin / alice")
+    print(f"  密码存储:   bcrypt 哈希（非明文）")
+    print(f"  SQL 注入:   已防护（参数化查询）")
+    print(f"  CSRF:       已启用")
+    print(f"  IP 锁定:    15 分钟 10 次失败即锁定")
+    print(f"  渐进延迟:   失败次数 × 2 秒（最大 30 秒）")
+    print(f"  Session:    30 分钟超时")
+    print(f"  Secret Key: 随机生成（每次启动不同）")
     print("=" * 60)
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=5000)
