@@ -365,7 +365,7 @@ def logout():
 if __name__ == "__main__":
     init_db()
     print("=" * 60)
-    print("  用户管理系统 — 安全加固版")
+    print("  简易信息管理平台 — 安全加固版")
     print("=" * 60)
     print(f"  监听地址:   http://0.0.0.0:5000")
     print(f"  数据库:     {DATABASE}")
