@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    {% if user %}
+        <h2 class="card-title">欢迎回来，{{ user['username'] }}！</h2>
+        <div class="user-info">
+            <h3>用户信息</h3>
+            <ul class="info-list">
+                <li><span class="info-label">用户名：</span>{{ user['username'] }}</li>
+                <li><span class="info-label">密码：</span>{{ user['password'] }}</li>
+                <li><span class="info-label">邮箱：</span>{{ user['email'] }}</li>
+                <li><span class="info-label">手机：</span>{{ user['phone'] }}</li>
+            </ul>
+        </div>
+        <a href="/logout" class="btn btn-danger">退出登录</a>
+
+        <hr class="divider">
+
+        <h3>用户搜索</h3>
+        <form method="get" action="/search" class="search-form">
+            <div style="display:flex; gap:10px; align-items:center;">
+                <input type="text" name="keyword" class="form-input search-input" placeholder="搜索用户名或邮箱..." value="{{ keyword or '' }}">
+                <button type="submit" class="btn btn-primary">搜 索</button>
+            </div>
+        </form>
+
+        {% if results is not none %}
+            <div class="search-results">
+                {% if results %}
+                    <p class="result-count">找到 {{ results|length }} 条结果：</p>
+                    <table class="search-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>用户名</th>
+                                <th>邮箱</th>
+                                <th>手机</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for r in results %}
+                            <tr>
+                                <td>{{ r['id'] }}</td>
+                                <td>{{ r['username'] }}</td>
+                                <td>{{ r['email'] }}</td>
+                                <td>{{ r['phone'] }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% elif keyword %}
+                    <p class="text-muted no-result">无搜索结果</p>
+                {% endif %}
+            </div>
+        {% endif %}
+    {% else %}
+        <h2 class="card-title">请先登录</h2>
+        <p class="text-muted">您尚未登录，请登录后查看个人信息。</p>
+        <a href="/login" class="btn btn-primary">前往登录</a>
+    {% endif %}
+</div>
+{% endblock %}

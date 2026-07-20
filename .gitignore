@@ -1,0 +1,28 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# 数据库文件
+*.db
+data/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Claude 会话记录
+.claude/
+
+# 日志
+*.log
