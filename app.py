@@ -8,15 +8,19 @@
   4. IP 级登录失败锁定 + 渐进式延迟（防暴力破解）
   5. 随机 secret_key + session 超时
   6. 统一错误提示防用户名枚举
+  7. 文件上传漏洞修复（类型校验 + 内容检测 + 安全命名）
 """
 import sqlite3
 import os
 import time
 import secrets
+import uuid
+import struct
 from datetime import datetime, timedelta
 
-from flask import Flask, render_template, request, redirect, session, g
+from flask import Flask, render_template, request, redirect, session, g, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
 # ============================================================
 # 1. 应用配置
@@ -25,6 +29,30 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)  # 随机 64 位密钥，每次启动不同
 app.permanent_session_lifetime = timedelta(minutes=30)  # session 30 分钟过期
 app.debug = False  # 关闭 debug 模式防信息泄露
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 最大上传 16MB
+
+# 允许上传的图片类型
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+
+# 图片文件魔数（文件头标识）
+IMAGE_SIGNATURES = {
+    b"\xff\xd8\xff": "jpeg",
+    b"\x89PNG\r\n\x1a\n": "png",
+    b"GIF87a": "gif",
+    b"GIF89a": "gif",
+    b"BM": "bmp",
+}
+
+
+def detect_image_type(data):
+    """通过文件头魔数检测是否为有效图片，返回图片类型或 None"""
+    for signature, img_type in IMAGE_SIGNATURES.items():
+        if data[:len(signature)] == signature:
+            return img_type
+    # WebP 特殊检测：RIFF....WEBP
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
 
 # ============================================================
 # 2. 数据库
@@ -53,6 +81,7 @@ def close_db(exception):
 def init_db():
     """初始化数据库并插入默认用户（密码哈希存储）"""
     os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
+    os.makedirs(os.path.join(BASE_DIR, "static", "uploads"), exist_ok=True)
     db = sqlite3.connect(DATABASE)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("""
@@ -349,7 +378,61 @@ def search():
 
 
 # ============================================================
-# 9. 路由 — 退出
+# 9. 路由 — 上传头像（已修复文件上传漏洞）
+# ============================================================
+
+def allowed_file(filename):
+    """检查文件扩展名是否在允许范围内"""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+@app.route("/upload", methods=["GET", "POST"])
+def upload():
+    """上传头像，需要登录"""
+    if "username" not in session:
+        return redirect("/login")
+
+    if request.method == "POST":
+        file = request.files.get("file")
+
+        # 检查是否有文件
+        if not file or not file.filename:
+            return render_template("upload.html", error="请选择要上传的文件")
+
+        # 检查文件扩展名
+        if not allowed_file(file.filename):
+            return render_template("upload.html",
+                                   error="仅支持上传图片文件（jpg、jpeg、png、gif、webp、bmp）")
+
+        # 检查文件内容是否为空
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+        if file_size == 0:
+            return render_template("upload.html", error="文件内容为空")
+
+        # 检查文件内容是否为真实图片（通过文件头魔数验证）
+        file_head = file.read(32)
+        file.seek(0)
+        if detect_image_type(file_head) is None:
+            return render_template("upload.html", error="文件不是有效的图片格式")
+
+        # 使用 secure_filename 清理文件名，再用 UUID 重命名防止覆盖
+        safe_name = secure_filename(file.filename)
+        ext = safe_name.rsplit(".", 1)[1].lower() if "." in safe_name else ""
+        unique_name = f"{uuid.uuid4().hex}.{ext}"
+
+        upload_dir = os.path.join(BASE_DIR, "static", "uploads")
+        filepath = os.path.join(upload_dir, unique_name)
+        file.save(filepath)
+        file_url = url_for("static", filename=f"uploads/{unique_name}")
+        return render_template("upload.html", file_url=file_url, filename=unique_name)
+
+    return render_template("upload.html")
+
+
+# ============================================================
+# 10. 路由 — 退出
 # ============================================================
 
 @app.route("/logout")
@@ -359,7 +442,7 @@ def logout():
 
 
 # ============================================================
-# 10. 启动入口
+# 11. 启动入口
 # ============================================================
 
 if __name__ == "__main__":
@@ -377,5 +460,6 @@ if __name__ == "__main__":
     print(f"  渐进延迟:   失败次数 × 2 秒（最大 30 秒）")
     print(f"  Session:    30 分钟超时")
     print(f"  Secret Key: 随机生成（每次启动不同）")
+    print(f"  上传限制:   16MB，仅限图片（已修复文件上传漏洞）")
     print("=" * 60)
     app.run(debug=False, host="0.0.0.0", port=5000)
