@@ -90,7 +90,8 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             email    TEXT,
-            phone    TEXT
+            phone    TEXT,
+            balance  REAL DEFAULT 0.0
         )
     """)
     db.execute("""
@@ -286,6 +287,7 @@ def login():
             record_login_attempt(ip_addr, True)
             session.permanent = True
             session["username"] = username
+            session["user_id"] = row["id"]
             user_info = {"id": row["id"], "username": row["username"],
                          "email": row["email"], "phone": row["phone"]}
             return render_template("index.html", user=user_info, keyword="", results=None)
@@ -432,7 +434,86 @@ def upload():
 
 
 # ============================================================
-# 10. 路由 — 退出
+# 10. 路由 — 个人中心（已修复越权漏洞）
+# ============================================================
+
+@app.route("/profile")
+def profile():
+    """个人中心 — 仅允许查看自己的资料"""
+    if "username" not in session:
+        return redirect("/login")
+
+    user_id = request.args.get("user_id")
+
+    # 越权修复：只允许查看自己的资料
+    if str(session.get("user_id")) != str(user_id):
+        return render_template("profile.html", user=None, error="无权查看其他用户的资料", csrf_token=generate_csrf_token())
+
+    db = get_db()
+    cur = db.execute(
+        "SELECT id, username, email, phone, balance FROM users WHERE id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    user_info = dict(row) if row else None
+    return render_template("profile.html", user=user_info, csrf_token=generate_csrf_token())
+
+
+# ============================================================
+# 11. 路由 — 充值（已修复逻辑漏洞）
+# ============================================================
+
+@app.route("/recharge", methods=["POST"])
+def recharge():
+    """充值 — 需登录 + CSRF + 仅限自己 + 金额正数"""
+    if "username" not in session:
+        return redirect("/login")
+
+    # CSRF 校验
+    if not validate_csrf_token():
+        return render_template("profile.html",
+                               user=None,
+                               error="Token 校验失败，请刷新页面重试。")
+
+    user_id = request.form.get("user_id")
+
+    # 越权修复：只允许给自己充值
+    if str(session.get("user_id")) != str(user_id):
+        return render_template("profile.html",
+                               user=None,
+                               error="无权给其他用户充值")
+
+    amount = request.form.get("amount", "0")
+    try:
+        amount = float(amount)
+    except ValueError:
+        amount = 0.0
+
+    # 逻辑修复：金额必须为正数
+    if amount <= 0:
+        # 重新查询用户信息传回页面
+        db = get_db()
+        cur = db.execute(
+            "SELECT id, username, email, phone, balance FROM users WHERE id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        user_info = dict(row) if row else None
+        return render_template("profile.html",
+                               user=user_info,
+                               error="充值金额必须大于 0")
+
+    db = get_db()
+    db.execute(
+        "UPDATE users SET balance = balance + ? WHERE id = ?",
+        (amount, user_id),
+    )
+    db.commit()
+    return redirect(f"/profile?user_id={user_id}")
+
+
+# ============================================================
+# 12. 路由 — 退出
 # ============================================================
 
 @app.route("/logout")
@@ -442,7 +523,7 @@ def logout():
 
 
 # ============================================================
-# 11. 启动入口
+# 13. 启动入口
 # ============================================================
 
 if __name__ == "__main__":

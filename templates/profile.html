@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+    {% if user %}
+        <h2 class="card-title">个人中心</h2>
+        <div class="user-info">
+            <h3>用户资料</h3>
+            <ul class="info-list">
+                <li><span class="info-label">ID：</span>{{ user['id'] }}</li>
+                <li><span class="info-label">用户名：</span>{{ user['username'] }}</li>
+                <li><span class="info-label">邮箱：</span>{{ user['email'] }}</li>
+                <li><span class="info-label">手机：</span>{{ user['phone'] }}</li>
+                <li><span class="info-label">余额：</span>{{ user['balance'] }} 元</li>
+            </ul>
+        </div>
+
+        <hr class="divider">
+
+        <h3>充值</h3>
+        {% if error %}
+            <p class="error-msg">{{ error }}</p>
+        {% endif %}
+        <form method="post" action="/recharge" class="recharge-form">
+            <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="user_id" value="{{ user['id'] }}">
+            <div class="form-group">
+                <label for="amount">充值金额</label>
+                <input type="number" id="amount" name="amount" class="form-input" step="0.01" placeholder="请输入充值金额" required>
+            </div>
+            <button type="submit" class="btn btn-primary">充 值</button>
+        </form>
+
+        <p class="text-muted" style="text-align:center; margin-top:1rem;">
+            <a href="/">返回首页</a>
+        </p>
+    {% else %}
+        <h2 class="card-title">无权访问</h2>
+        <p class="error-msg">{{ error if error else '您无权查看其他用户的资料' }}</p>
+        <a href="/" class="btn btn-primary">返回首页</a>
+    {% endif %}
+</div>
+{% endblock %}
