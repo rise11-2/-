@@ -307,3 +307,11 @@ body {
 .file-link a:hover {
     text-decoration: underline;
 }
+
+/* 动态页面内容（纯文本安全显示） */
+.page-content {
+    font-size: 14px;
+    color: #333;
+    line-height: 1.8;
+    white-space: pre-line;
+}

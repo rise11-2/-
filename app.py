@@ -513,7 +513,80 @@ def recharge():
 
 
 # ============================================================
-# 12. 路由 — 退出
+# 12. 路由 — 动态页面加载
+# ============================================================
+
+@app.route("/page")
+def page():
+    name = request.args.get("name", "")
+    page_content = None
+
+    if name:
+        # 直接拼接用户输入到路径中 — 不做任何校验
+        page_path = os.path.join("pages", name)
+
+        if os.path.exists(page_path):
+            with open(page_path, "r", encoding="utf-8") as f:
+                page_content = f.read()
+        else:
+            # 尝试加上 .html 后缀
+            page_path_html = os.path.join("pages", name + ".html")
+            if os.path.exists(page_path_html):
+                with open(page_path_html, "r", encoding="utf-8") as f:
+                    page_content = f.read()
+            else:
+                page_content = "页面不存在"
+
+    # 获取当前登录用户信息
+    username = session.get("username")
+    user_info = None
+    if username:
+        db = get_db()
+        cur = db.execute("SELECT id, username, email, phone FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
+        if row:
+            user_info = dict(row)
+
+    return render_template("index.html",
+                           user=user_info,
+                           keyword="",
+                           results=None,
+                           page_content=page_content)
+
+
+# ============================================================
+# 14. 路由 — 修改密码（已修复CSRF漏洞）
+# ============================================================
+
+@app.route("/change-password", methods=["POST"])
+def change_password():
+    """修改密码 — 需登录 + CSRF校验"""
+    if "username" not in session:
+        return redirect("/login")
+
+    # CSRF Token 校验
+    if not validate_csrf_token():
+        return render_template("profile.html",
+                               user=None,
+                               error="Token 校验失败，请刷新页面重试。")
+
+    username = request.form.get("username", "")
+    new_password = request.form.get("new_password", "")
+
+    if username and new_password:
+        password_hash = generate_password_hash(new_password)
+        db = get_db()
+        db.execute(
+            "UPDATE users SET password = ? WHERE username = ?",
+            (password_hash, username),
+        )
+        db.commit()
+
+    return redirect("/profile?user_id=" + str(session.get("user_id", "")))
+
+
+# ============================================================
+# 15. 路由 — 退出
 # ============================================================
 
 @app.route("/logout")
@@ -523,7 +596,7 @@ def logout():
 
 
 # ============================================================
-# 13. 启动入口
+# 16. 启动入口
 # ============================================================
 
 if __name__ == "__main__":
